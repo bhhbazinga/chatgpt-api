@@ -47,7 +47,8 @@
     "random": "^4.1.0",
     "remark": "^14.0.2",
     "strip-markdown": "^5.0.0",
-    "uuid": "^9.0.0"
+    "uuid": "^9.0.0",
+    "yargs": "^7.1.0"
   },
   "devDependencies": {
     "@trivago/prettier-plugin-sort-imports": "^4.0.0",
