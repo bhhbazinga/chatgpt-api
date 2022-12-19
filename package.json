@@ -48,6 +48,7 @@
     "remark": "^14.0.2",
     "strip-markdown": "^5.0.0",
     "uuid": "^9.0.0",
+    "ws": "^8.11.0",
     "yargs": "^7.1.0"
   },
   "devDependencies": {
