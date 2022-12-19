@@ -21,6 +21,7 @@ export class ChatGPTAPIBrowser extends AChatGPTAPI {
   protected _debug: boolean
   protected _minimize: boolean
   protected _isGoogleLogin: boolean
+  protected _isMicrosoftLogin: boolean
   protected _captchaToken: string
   protected _accessToken: string
 
@@ -30,6 +31,7 @@ export class ChatGPTAPIBrowser extends AChatGPTAPI {
   protected _executablePath: string
   protected _browser: Browser
   protected _page: Page
+  protected _proxyServer: string
 
   /**
    * Creates a new client for automating the ChatGPT webapp.
@@ -47,6 +49,9 @@ export class ChatGPTAPIBrowser extends AChatGPTAPI {
     /** @defaultValue `false` **/
     isGoogleLogin?: boolean
 
+    /** @defaultValue `false` **/
+    isMicrosoftLogin?: boolean
+
     /** @defaultValue `true` **/
     minimize?: boolean
 
@@ -55,6 +60,9 @@ export class ChatGPTAPIBrowser extends AChatGPTAPI {
 
     /** @defaultValue `undefined` **/
     executablePath?: string
+
+    /** @defaultValue `undefined` **/
+    proxyServer?: string
   }) {
     super()
 
@@ -64,9 +72,11 @@ export class ChatGPTAPIBrowser extends AChatGPTAPI {
       markdown = true,
       debug = false,
       isGoogleLogin = false,
+      isMicrosoftLogin = false,
       minimize = true,
       captchaToken,
-      executablePath
+      executablePath,
+      proxyServer
     } = opts
 
     this._email = email
@@ -75,9 +85,11 @@ export class ChatGPTAPIBrowser extends AChatGPTAPI {
     this._markdown = !!markdown
     this._debug = !!debug
     this._isGoogleLogin = !!isGoogleLogin
+    this._isMicrosoftLogin = !!isMicrosoftLogin
     this._minimize = !!minimize
     this._captchaToken = captchaToken
     this._executablePath = executablePath
+    this._proxyServer = proxyServer
 
     if (!this._email) {
       const error = new types.ChatGPTError('ChatGPT invalid email')
@@ -100,7 +112,8 @@ export class ChatGPTAPIBrowser extends AChatGPTAPI {
     try {
       this._browser = await getBrowser({
         captchaToken: this._captchaToken,
-        executablePath: this._executablePath
+        executablePath: this._executablePath,
+        proxyServer: this._proxyServer
       })
       this._page =
         (await this._browser.pages())[0] || (await this._browser.newPage())
@@ -125,7 +138,8 @@ export class ChatGPTAPIBrowser extends AChatGPTAPI {
         password: this._password,
         browser: this._browser,
         page: this._page,
-        isGoogleLogin: this._isGoogleLogin
+        isGoogleLogin: this._isGoogleLogin,
+        isMicrosoftLogin: this._isMicrosoftLogin
       })
     } catch (err) {
       if (this._browser) {
@@ -138,7 +152,7 @@ export class ChatGPTAPIBrowser extends AChatGPTAPI {
       throw err
     }
 
-    if (!this.isChatPage) {
+    if (!this.isChatPage || this._isGoogleLogin || this._isMicrosoftLogin) {
       await this._page.goto(CHAT_PAGE_URL, {
         waitUntil: 'networkidle2'
       })
@@ -148,11 +162,11 @@ export class ChatGPTAPIBrowser extends AChatGPTAPI {
     do {
       const modalSelector = '[data-headlessui-state="open"]'
 
-      if (!(await this._page.$(modalSelector))) {
-        break
-      }
-
       try {
+        if (!(await this._page.$(modalSelector))) {
+          break
+        }
+
         await this._page.click(`${modalSelector} button:last-child`)
       } catch (err) {
         // "next" button not found in welcome modal
@@ -283,7 +297,9 @@ export class ChatGPTAPIBrowser extends AChatGPTAPI {
   async refreshSession() {
     console.log(`ChatGPT "${this._email}" session expired (403); refreshing...`)
     try {
-      await maximizePage(this._page)
+      if (!this._minimize) {
+        await maximizePage(this._page)
+      }
       await this._page.reload({
         waitUntil: 'networkidle2',
         timeout: 2 * 60 * 1000 // 2 minutes
@@ -390,25 +406,6 @@ export class ChatGPTAPIBrowser extends AChatGPTAPI {
       onProgress
     } = opts
 
-    if (!(await this.getIsAuthenticated())) {
-      console.log(`chatgpt re-authenticating ${this._email}`)
-
-      try {
-        await this.resetSession()
-      } catch (err) {
-        console.warn(
-          `chatgpt error re-authenticating ${this._email}`,
-          err.toString()
-        )
-      }
-
-      if (!(await this.getIsAuthenticated())) {
-        const error = new types.ChatGPTError('Not signed in')
-        error.statusCode = 401
-        throw error
-      }
-    }
-
     const url = `https://chat.openai.com/backend-api/conversation`
     const body: types.ConversationJSONBody = {
       action,
@@ -429,6 +426,9 @@ export class ChatGPTAPIBrowser extends AChatGPTAPI {
     if (conversationId) {
       body.conversation_id = conversationId
     }
+
+    let result: types.ChatResponse | types.ChatError
+    let numTries = 0
 
     let serverPort: number
     let webSocketServer: WebSocket
@@ -451,21 +451,59 @@ export class ChatGPTAPIBrowser extends AChatGPTAPI {
       })
     }
 
-    // console.log('>>> EVALUATE', url, this._accessToken, body)
-    const result = await this._page.evaluate(
-      browserPostEventStream,
-      url,
-      this._accessToken,
-      body,
-      timeoutMs,
-      serverPort
-    )
-    // console.log('<<< EVALUATE', result)
+    do {
+      if (!(await this.getIsAuthenticated())) {
+        console.log(`chatgpt re-authenticating ${this._email}`)
+
+        try {
+          await this.resetSession()
+        } catch (err) {
+          console.warn(
+            `chatgpt error re-authenticating ${this._email}`,
+            err.toString()
+          )
+        }
+
+        if (!(await this.getIsAuthenticated())) {
+          const error = new types.ChatGPTError('Not signed in')
+          error.statusCode = 401
+          throw error
+        }
+      }
+
+      try {
+        // console.log('>>> EVALUATE', url, this._accessToken, body)
+        result = await this._page.evaluate(
+          browserPostEventStream,
+          url,
+          this._accessToken,
+          body,
+          timeoutMs,
+          serverPort
+        )
+      } catch (err) {
+        // We catch all errors in `browserPostEventStream`, so this should really
+        // only happen if the page is refreshed or closed during its invocation.
+        // This may happen if we encounter a 401/403 and refresh the page in it's
+        // response handler or if the user has closed the page manually.
+
+        if (++numTries >= 2) {
+          const error = new types.ChatGPTError(err.toString())
+          error.statusCode = err.response?.statusCode
+          error.statusText = err.response?.statusText
+          throw error
+        }
+
+        console.warn('chatgpt sendMessage error; retrying...', err.toString())
+        await delay(5000)
+      }
+    } while (!result)
 
     if (webSocketServer) {
       webSocketServer.close()
     }
 
+    // console.log('<<< EVALUATE', result)
     if ('error' in result) {
       const error = new types.ChatGPTError(result.error.message)
       error.statusCode = result.error.statusCode
@@ -543,8 +581,11 @@ export class ChatGPTAPIBrowser extends AChatGPTAPI {
   }
 
   protected async _getInputBox() {
-    // [data-id="root"]
-    return this._page.$('textarea')
+    try {
+      return await this._page.$('textarea')
+    } catch (err) {
+      return null
+    }
   }
 
   get isChatPage(): boolean {

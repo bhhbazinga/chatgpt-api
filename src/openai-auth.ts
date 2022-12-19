@@ -53,8 +53,11 @@ export async function getOpenAIAuth({
   page,
   timeoutMs = 2 * 60 * 1000,
   isGoogleLogin = false,
+  isMicrosoftLogin = false,
   captchaToken = process.env.CAPTCHA_TOKEN,
-  executablePath
+  nopechaKey = process.env.NOPECHA_KEY,
+  executablePath,
+  proxyServer = process.env.PROXY_SERVER
 }: {
   email?: string
   password?: string
@@ -62,15 +65,23 @@ export async function getOpenAIAuth({
   page?: Page
   timeoutMs?: number
   isGoogleLogin?: boolean
+  isMicrosoftLogin?: boolean
   captchaToken?: string
+  nopechaKey?: string
   executablePath?: string
+  proxyServer?: string
 }): Promise<OpenAIAuth> {
   const origBrowser = browser
   const origPage = page
 
   try {
     if (!browser) {
-      browser = await getBrowser({ captchaToken, executablePath })
+      browser = await getBrowser({
+        captchaToken,
+        nopechaKey,
+        executablePath,
+        proxyServer
+      })
     }
 
     const userAgent = await browser.userAgent()
@@ -84,11 +95,17 @@ export async function getOpenAIAuth({
     })
 
     // NOTE: this is where you may encounter a CAPTCHA
-    if (hasRecaptchaPlugin) {
-      await page.solveRecaptchas()
-    }
-
     await checkForChatGPTAtCapacity(page, { timeoutMs })
+
+    if (hasRecaptchaPlugin) {
+      const captchas = await page.findRecaptchas()
+
+      if (captchas?.filtered?.length) {
+        console.log('solving captchas using 2captcha...')
+        const res = await page.solveRecaptchas()
+        console.log('captcha result', res)
+      }
+    }
 
     // once we get to this point, the Cloudflare cookies should be available
 
@@ -124,6 +141,23 @@ export async function getOpenAIAuth({
         await page.waitForSelector('input[type="password"]', { visible: true })
         await page.type('input[type="password"]', password, { delay: 10 })
         submitP = () => page.keyboard.press('Enter')
+      } else if (isMicrosoftLogin) {
+        await page.click('button[data-provider="windowslive"]')
+        await page.waitForSelector('input[type="email"]')
+        await page.type('input[type="email"]', email, { delay: 10 })
+        await Promise.all([
+          page.waitForNavigation(),
+          await page.keyboard.press('Enter')
+        ])
+        await delay(1500)
+        await page.waitForSelector('input[type="password"]', { visible: true })
+        await page.type('input[type="password"]', password, { delay: 10 })
+        submitP = () => page.keyboard.press('Enter')
+        await Promise.all([
+          page.waitForNavigation(),
+          await page.keyboard.press('Enter')
+        ])
+        await delay(1000)
       } else {
         await page.waitForSelector('#username')
         await page.type('#username', email, { delay: 20 })
@@ -133,8 +167,13 @@ export async function getOpenAIAuth({
         if (hasNopechaExtension) {
           await waitForRecaptcha(page, { timeoutMs })
         } else if (hasRecaptchaPlugin) {
+          console.log('solving captchas using 2captcha...')
           const res = await page.solveRecaptchas()
-          console.log('solveRecaptchas result', res)
+          if (res.captchas?.length) {
+            console.log('captchas result', res)
+          } else {
+            console.log('no captchas found')
+          }
         }
 
         await delay(1200)
@@ -203,12 +242,14 @@ export async function getBrowser(
   opts: PuppeteerLaunchOptions & {
     captchaToken?: string
     nopechaKey?: string
+    proxyServer?: string
   } = {}
 ) {
   const {
     captchaToken = process.env.CAPTCHA_TOKEN,
     nopechaKey = process.env.NOPECHA_KEY,
     executablePath = defaultChromeExecutablePath(),
+    proxyServer = process.env.PROXY_SERVER,
     ...launchOptions
   } = opts
 
@@ -233,10 +274,20 @@ export async function getBrowser(
     '--disable-infobars',
     '--disable-dev-shm-usage',
     '--disable-blink-features=AutomationControlled',
+    '--ignore-certificate-errors',
     '--no-first-run',
     '--no-service-autorun',
     '--password-store=basic',
-    '--system-developer-mode'
+    '--system-developer-mode',
+    // the following flags all try to reduce memory
+    // '--single-process',
+    '--mute-audio',
+    '--disable-default-apps',
+    '--no-zygote',
+    '--disable-accelerated-2d-canvas',
+    '--disable-web-security',
+    '--disable-gpu'
+    // '--js-flags="--max-old-space-size=1024"'
   ]
 
   if (nopechaKey) {
@@ -249,6 +300,10 @@ export async function getBrowser(
     puppeteerArgs.push(`--disable-extensions-except=${nopechaPath}`)
     puppeteerArgs.push(`--load-extension=${nopechaPath}`)
     hasNopechaExtension = true
+  }
+
+  if (proxyServer) {
+    puppeteerArgs.push(`--proxy-server=${proxyServer}`)
   }
 
   const browser = await puppeteer.launch({
@@ -265,12 +320,33 @@ export async function getBrowser(
     ...launchOptions
   })
 
+  if (process.env.PROXY_VALIDATE_IP) {
+    const page = (await browser.pages())[0] || (await browser.newPage())
+    // send a fetch request to https://ifconfig.co using page.evaluate() and verify the IP matches
+    let ip
+    try {
+      ;({ ip } = await page.evaluate(() => {
+        return fetch('https://ifconfig.co', {
+          headers: {
+            Accept: 'application/json'
+          }
+        }).then((res) => res.json())
+      }))
+    } catch (err) {
+      throw new Error(`Proxy IP validation failed: ${err.message}`)
+    }
+    if (ip !== process.env.PROXY_VALIDATE_IP) {
+      throw new Error(
+        `Proxy IP mismatch: ${ip} !== ${process.env.PROXY_VALIDATE_IP}`
+      )
+    }
+  }
+
   // TOdO: this is a really hackity hack way of setting the API key...
   if (hasNopechaExtension) {
     const page = (await browser.pages())[0] || (await browser.newPage())
     await page.goto(`https://nopecha.com/setup#${nopechaKey}`)
     await delay(1000)
-
     try {
       const page3 = await browser.newPage()
       await page.close()
@@ -301,11 +377,20 @@ export async function getBrowser(
         const editKey = await page3.waitForSelector('#edit_key .clickable')
         await editKey.click()
 
-        const settingsInput = await page3.$('input.settings_text')
+        const settingsInput = await page3.waitForSelector('input.settings_text')
+        // console.log('value1', await settingsInput.evaluate((el) => el.value))
+
+        await settingsInput.evaluate((el) => {
+          el.value = ''
+        })
         await settingsInput.type(nopechaKey)
+
+        // console.log('value2', await settingsInput.evaluate((el) => el.value))
         await settingsInput.evaluate((el, value) => {
           el.value = value
         }, nopechaKey)
+
+        // console.log('value3', await settingsInput.evaluate((el) => el.value))
         await settingsInput.press('Enter')
         await delay(500)
         await editKey.click()
@@ -328,6 +413,10 @@ export async function getBrowser(
  * Gets the default path to chrome's executable for the current platform.
  */
 export const defaultChromeExecutablePath = (): string => {
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    return process.env.PUPPETEER_EXECUTABLE_PATH
+  }
+
   switch (os.platform()) {
     case 'win32':
       return 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
